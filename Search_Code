@@ -1,0 +1,168 @@
+# -*- coding: utf-8 -*-
+import os, time, math, re
+from datetime import datetime
+from collections import defaultdict
+import pandas as pd
+from tqdm import tqdm
+from Bio import Entrez, Medline
+
+# ===== 配置 =====
+# 1111111111111111
+Entrez.api_key = os.environ.get("NCBI_API_KEY", "1111111111111111").strip() or None # 可自行修改
+HAS_KEY = bool(Entrez.api_key)
+
+# 一级搜索，必须命中其一
+KEYWORDS = ["A", "B"] # 可自行增减或修改
+
+# 额外筛选关键词（命中其一即可；不区分大小写）
+SCREEN_KEYWORDS = ["a", "b", "c", "d"]  # 可自行增减或修改
+
+YEAR_FILTER = '("2013"[Date - Publication] : "2023"[Date - Publication])' # 可自行修改索引时间
+
+ESEARCH_PAGE = 100000
+EFETCH_CHUNK = 200 if HAS_KEY else 100
+PAUSE = 0.11 if HAS_KEY else 0.34
+
+OUT_BASE = f"pubmed_multi_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+def esearch_all_ids(term: str):
+    h = Entrez.esearch(db="pubmed", term=term, retmode="xml", retmax=0)
+    root = Entrez.read(h)
+    h.close()
+    total = int(root.get("Count", 0))
+    ids = []
+    for start in range(0, total, ESEARCH_PAGE):
+        h = Entrez.esearch(db="pubmed", term=term, retmode="xml",
+                           retstart=start, retmax=ESEARCH_PAGE)
+        r = Entrez.read(h)
+        h.close()
+        ids.extend(r.get("IdList", []))
+        time.sleep(PAUSE)
+    return ids, total
+
+def build_screen_group(screen_keywords):
+    parts = [f'"{kw}"[All Fields]' if " " in kw else f'{kw}[All Fields]'
+             for kw in screen_keywords]
+    return "(" + " OR ".join(parts) + ")"
+
+
+pmid_to_keywords = defaultdict(set)
+total_hits_sum = 0
+screen_group = build_screen_group(SCREEN_KEYWORDS) if SCREEN_KEYWORDS else None
+
+for kw in KEYWORDS:
+    term = f'({kw}) AND {YEAR_FILTER}'
+    if screen_group:
+        term = f'({kw}) AND {screen_group} AND {YEAR_FILTER}'
+    ids, total = esearch_all_ids(term)
+    total_hits_sum += total
+    for pid in ids:
+        pmid_to_keywords[pid].add(kw)
+    print(f"[SEARCH] {kw}: {total} PMIDs (collected {len(ids)})")
+
+print(f"[SEARCH] Unique PMIDs: {len(pmid_to_keywords)} (from {total_hits_sum} total hits across keywords)")
+if not pmid_to_keywords:
+    print("No results. Exiting.")
+    raise SystemExit(0)
+
+
+screen_patterns = [(kw, re.compile(rf"(?i){re.escape(kw)}")) for kw in SCREEN_KEYWORDS] if SCREEN_KEYWORDS else []
+
+def matched_screen_keywords(title, abstract, mh_list, ot_list):
+    """返回命中的筛选关键词列表；大小写不敏感；匹配 TI/AB/MH/OT"""
+    if not screen_patterns:
+        return []
+    bag = " ".join([
+        title or "",
+        abstract or "",
+        " ".join(mh_list or []),
+        " ".join(ot_list or []),
+    ])
+    hits = []
+    for kw, pat in screen_patterns:
+        if pat.search(bag):
+            hits.append(kw)
+    # 去重并稳定排序
+    return sorted(set(hits), key=lambda x: SCREEN_KEYWORDS.index(x) if x in SCREEN_KEYWORDS else 1e9)
+
+
+pmids = list(pmid_to_keywords.keys())
+num_batches = math.ceil(len(pmids) / EFETCH_CHUNK)
+
+rows, errors = [], []
+kept, seen = 0, 0
+
+for i in tqdm(range(num_batches), desc="Fetching batches", unit="batch"):
+    batch_pmids = pmids[i*EFETCH_CHUNK:(i+1)*EFETCH_CHUNK]
+    try:
+        with Entrez.efetch(db="pubmed", id=",".join(batch_pmids),
+                           rettype="medline", retmode="text") as h:
+            records = list(Medline.parse(h))
+    except Exception as e:
+        errors.extend(batch_pmids)
+        tqdm.write(f"[EFETCH ERROR] batch {i+1}/{num_batches}: {e}")
+        time.sleep(PAUSE * 2)
+        continue
+
+    for rec in records:
+        seen += 1
+        pmid = str(rec.get("PMID", "")) or ""
+        title = rec.get("TI", "") or ""
+        abstract = rec.get("AB", "") or ""
+        mh_list = rec.get("MH", []) or []
+        ot_list = rec.get("OT", []) or []
+
+        hits = matched_screen_keywords(title, abstract, mh_list, ot_list)
+        if SCREEN_KEYWORDS and not hits:
+            continue  # 未命中任何筛选词则剔除
+
+        authors = rec.get("AU", []) or []
+        journal = rec.get("JT", "") or rec.get("TA", "") or ""
+        dp = rec.get("DP", "") or ""
+        year = dp.split()[0][:4] if dp else ""
+        year = year if year.isdigit() else ""
+        volume = rec.get("VI", "") or ""
+        issue = rec.get("IP", "") or ""
+        citation = rec.get("SO", "") or ""
+
+        rows.append({
+            "Keyword": "; ".join(sorted(pmid_to_keywords.get(pmid, []))),
+            "ScreenHit": "; ".join(hits),  # <<< 新增列：命中的筛选关键词
+            "pmid": pmid,
+            "Title": title,
+            "Abstract": abstract,
+            "Author": ", ".join(authors),
+            "Year": year,
+            "Volume": volume,
+            "Issue": issue,
+            "Journal": journal,
+            "Citation": citation,
+            "Link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+        })
+        kept += 1
+
+    time.sleep(PAUSE)
+
+print(f"[SCREEN] Detailed-screen kept {kept}/{seen} records after efetch.")
+
+# ===== 导出 =====
+df = pd.DataFrame(rows, columns=[
+    "Keyword","ScreenHit","pmid","Title","Abstract","Author","Year","Volume","Issue","Journal","Citation","Link"
+])
+
+csv_path = f"{OUT_BASE}.csv"
+xlsx_path = f"{OUT_BASE}.xlsx"
+df.to_csv(csv_path, index=False)
+try:
+    df.to_excel(xlsx_path, index=False)
+except Exception as e:
+    print(f"[WARN] Excel export failed: {e}")
+
+print(f"[DONE] Saved {len(df)} rows → {csv_path} & {xlsx_path}")
+
+# ===== 失败日志 =====
+if errors:
+    err_path = f"{OUT_BASE}_errors.txt"
+    with open(err_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(map(str, errors)))
+    print(f"[DONE] {len(errors)} PMIDs failed. Logged to {err_path}")
